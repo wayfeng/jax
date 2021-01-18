@@ -252,7 +252,7 @@ def xmap(fun: Callable,
     axis_sizes = _get_axis_sizes(args_flat, in_axes_flat)
     out_flat = xmap_p.bind(
       fun_flat, *args_flat,
-      name=fun.__name__,
+      name=getattr(fun, '__name__', 'unknown'),
       in_axes=tuple(in_axes_flat),
       out_axes_thunk=out_axes_thunk,
       axis_sizes=FrozenDict(axis_sizes),
