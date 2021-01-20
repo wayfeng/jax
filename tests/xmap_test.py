@@ -275,123 +275,103 @@ class XMapTestSPMD(XMapTest):
     jax.experimental.maps.make_xmap_callable.cache_clear()
     jax.experimental.maps.EXPERIMENTAL_SPMD_LOWERING = self.old_lowering_flag
 
+AxisIndices = Tuple[int, ...]
+MatchedAxisIndices = Tuple[AxisIndices, AxisIndices]
+AxisNames = Tuple[str, ...]
 
-LHSSpec = RHSSpec = Tuple[int, ...]
-DimSpec = Tuple[LHSSpec, RHSSpec]
+class PdotTestSpec:
+  # The axis indices stored by a PdotTestSpec are all positional indices
+  # *before* taking mapping into account.
+  map_cont: MatchedAxisIndices
+  pos_cont: MatchedAxisIndices
+  map_batch: MatchedAxisIndices
+  pos_batch: MatchedAxisIndices
+  all_names: AxisNames
+  contract_names: AxisNames
+  batch_names: AxisNames
 
-class PdotSpec(NamedTuple):
-  """Specifies positional axes to contract or batch via mapping or position."""
-  map_contract: DimSpec
-  pos_contract: DimSpec
-  map_batch: DimSpec
-  pos_batch: DimSpec
+  def __init__(self, map_cont, pos_cont, map_batch, pos_batch):
+    self.map_cont = map_cont
+    self.pos_cont = pos_cont
+    self.map_batch = map_batch
+    self.pos_batch = pos_batch
+
+    names = gen_axis_names()
+    self.contract_names = [next(names) for _ in range(len(map_cont[0]))]
+    self.batch_names = [next(names) for _ in range(len(map_batch[0]))]
+    self.all_names = self.contract_names + self.batch_names
 
   @property
-  def num_mapped(self):
-    return len(self.lhs_mapped)
-
-  @property
-  def num_mapped_contract(self):
-    return len(self.map_contract[0])
-
-  @property
-  def lhs_mapped(self):
-    return [*self.map_contract[0], *self.map_batch[0]]
-
-  @property
-  def rhs_mapped(self):
-    return [*self.map_contract[1], *self.map_batch[1]]
+  def dot_general_dim_nums(self):
+    lhs_contract = (*self.map_cont[0], *self.pos_cont[0])
+    rhs_contract = (*self.map_cont[1], *self.pos_cont[1])
+    lhs_batch = (*self.map_batch[0], *self.pos_batch[0])
+    rhs_batch = (*self.map_batch[1], *self.pos_batch[1])
+    return (lhs_contract, rhs_contract), (lhs_batch, rhs_batch)
 
   @property
   def pos_contract_after_mapping(self):
-    lhs_pos_contract_ = [i - sum(j < i for j in self.lhs_mapped)
-                         for i in self.pos_contract[0]]
-    rhs_pos_contract_ = [i - sum(j < i for j in self.rhs_mapped)
-                         for i in self.pos_contract[1]]
-    return (lhs_pos_contract_, rhs_pos_contract_)
+    lhs = [i - sum(j < i for j in self._lhs_mapped) for i in self.pos_cont[0]]
+    rhs = [i - sum(j < i for j in self._rhs_mapped) for i in self.pos_cont[1]]
+    return (lhs, rhs)
 
   @property
   def pos_batch_after_mapping(self):
-    lhs_pos_batch_ = [i - sum(j < i for j in self.lhs_mapped)
-                      for i in self.pos_batch[0]]
-    rhs_pos_batch_ = [i - sum(j < i for j in self.rhs_mapped)
-                      for i in self.pos_batch[1]]
-    return (lhs_pos_batch_, rhs_pos_batch_)
+    lhs = [i - sum(j < i for j in self._lhs_mapped) for i in self.pos_batch[0]]
+    rhs = [i - sum(j < i for j in self._rhs_mapped) for i in self.pos_batch[1]]
+    return (lhs, rhs)
 
   @property
-  def all_contract(self):
-    lhs_contract = [*self.map_contract[0], *self.pos_contract[0]]
-    rhs_contract = [*self.map_contract[1], *self.pos_contract[1]]
-    return lhs_contract, rhs_contract
+  def _lhs_mapped(self):
+    return {*self.map_cont[0], *self.map_batch[0]}
 
   @property
-  def all_batch(self):
-    lhs_batch = [*self.map_batch[0], *self.pos_batch[0]]
-    rhs_batch = [*self.map_batch[1], *self.pos_batch[1]]
-    return lhs_batch, rhs_batch
+  def _rhs_mapped(self):
+    return {*self.map_cont[1], *self.map_batch[1]}
 
-def all_pdot_specs(lhs_shape: Tuple[int], rhs_shape: Tuple[int]
-                   ) -> Generator[PdotSpec, None, None]:
-  """Test utility to generate all valid pdot specs for given shapes."""
-  for dim_nums in all_dot_general_dimension_numbers(lhs_shape, rhs_shape):
-    yield from map_some_axes(dim_nums)
+  @property
+  def lhs_in_axes(self):
+    axis_indices = [*self.map_cont[0], *self.map_batch[0]]
+    return dict(zip(axis_indices, self.all_names))
 
-def all_dot_general_dimension_numbers(
-    lhs_shape: Sequence[int], rhs_shape: Sequence[int]
-  ) -> Generator[DotDimensionNumbers, None, None]:
-  """Test utility to generate all valid dot_general specs for given shapes."""
-  # The recursive 'helper' function generates all possible DotDimensionNumbers
-  # while excluding certain axis positions. The base case in the first yield is
-  # not to assign any additional axes to be batched or contracted, while the
-  # recursive cases in the latter two yields come from choosing equal-sized axes
-  # to batch or contract (recursing to possibly choose more axes).
-  def helper(excluded1: Set[int], excluded2: Set[int]):
-    yield ((), ()), ((), ())
-    for i, d1 in enumerate(lhs_shape):
-      if i not in excluded1:
+  @property
+  def rhs_in_axes(self):
+    axis_indices = [*self.map_cont[1], *self.map_batch[1]]
+    return dict(zip(axis_indices, self.all_names))
+
+def all_pdot_specs(lhs_shape, rhs_shape):
+  for matching in axis_matchings(lhs_shape, rhs_shape):
+    for lists in partitions(matching, 4):
+      yield PdotTestSpec(*map(unzip2, lists))
+
+def axis_matchings(lhs_shape, rhs_shape):
+  def helper(start, exc1, exc2):
+    yield ()
+    for i in range(start, len(lhs_shape)):
+      d1 = lhs_shape[i]
+      if i not in exc1:
         for j, d2 in enumerate(rhs_shape):
-          if j not in excluded2 and d1 == d2 and j <= i:
-            for contract, batch in helper(excluded1 | {i}, excluded2 | {j}):
-              (lhs_cont, rhs_cont), (lhs_batch, rhs_batch) = contract, batch
-              yield (lhs_cont + (i,), rhs_cont + (j,)), batch
-              yield contract, (lhs_batch + (i,), rhs_batch + (j,))
-  return helper(set(), set())
+          if d1 == d2 and j not in exc2:
+            for matches in helper(i + 1, exc1 | {i}, exc2 | {j}):
+              yield ((i, j), *matches)
+  return helper(0, set(), set())
 
-def map_some_axes(dim_nums: DotDimensionNumbers
-                  ) -> Generator[PdotSpec, None, None]:
-  """Helper function to generate pdot specs from dot_general dim nums."""
-  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dim_nums
-  for idx1 in powerset(range(len(lhs_contract))):
-    map_lhs_contract, pos_lhs_contract = partition(idx1, lhs_contract)
-    map_rhs_contract, pos_rhs_contract = partition(idx1, rhs_contract)
-    for idx2 in powerset(range(len(lhs_batch))):
-      map_lhs_batch, pos_lhs_batch = partition(idx2, lhs_batch)
-      map_rhs_batch, pos_rhs_batch = partition(idx2, rhs_batch)
-      yield PdotSpec((map_lhs_contract, map_rhs_contract),
-                     (pos_lhs_contract, pos_rhs_contract),
-                     (map_lhs_batch, map_rhs_batch),
-                     (pos_lhs_batch, pos_rhs_batch))
+def partitions(s, k):
+  for indices in it.product(range(k), repeat=len(s)):
+    outs = [[] for _ in range(k)]
+    for i, elt in zip(indices, s):
+      outs[i].append(elt)
+    yield outs
 
-def powerset(itr: Iterable[Hashable]) -> Iterator[Set[Hashable]]:
-  # from an itertools recipe
-  lst = list(itr)
-  outs = map(set, (it.combinations(lst, r) for r in range(len(lst) + 1)))
-  return it.chain.from_iterable(outs)
+def powerset(s):
+  s = list(s)
+  return it.chain.from_iterable(it.combinations(s, r) for r in range(len(s)+1))
 
-def partition(mapped_idx: Set[int], lst: List[Any]
-              ) -> Tuple[List[Any], List[Any]]:
-  lists = [], []
-  for i, elt in enumerate(lst):
-    lists[i not in mapped_idx].append(elt)
-  return lists
-
-def gen_axis_names(n: int):
-  def _axis_names():
-    names = 'ijkl'
-    for n in it.count(1):
-      for chars in it.product(names, repeat=n):
-        yield ''.join(chars)
-  return list(it.islice(_axis_names(), n))
+def gen_axis_names():
+  names = 'ijkl'
+  for n in it.count(1):
+    for chars in it.product(names, repeat=n):
+      yield ''.join(chars)
 
 AxisResources = List[Dict[str, str]]
 MeshSpec = List[Tuple[str, int]]
@@ -456,15 +436,13 @@ def generate_mesh(named_shape: MeshSpec) -> Generator[None, None, None]:
     yield
 
 def schedules_from_pdot_spec(
-    spec: PdotSpec, lhs_shape: Tuple[int], rhs_shape: Tuple[int]
+    spec: PdotTestSpec, lhs_shape: Tuple[int], rhs_shape: Tuple[int]
     ) -> Generator[Tuple[AxisResources, MeshSpec], None, None]:
-  names = gen_axis_names(spec.num_mapped)
-  lhs_spec = dict(zip(spec.lhs_mapped, names))
-  rhs_spec = dict(zip(spec.rhs_mapped, names))
   logical_sizes = {
       name: shape[ax]
-      for shape, spec in [(lhs_shape, lhs_spec), (rhs_shape, rhs_spec)]
-      for ax, name in spec.items()}
+      for shape, in_axes in [(lhs_shape, spec.lhs_in_axes),
+                                 (rhs_shape, spec.rhs_in_axes)]
+      for ax, name in in_axes.items()}
   yield from schedules(logical_sizes)
 
 
@@ -534,43 +512,39 @@ class PDotTests(jtu.JaxTestCase):
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": f"_{next(test_counter)}",
-       "lhs_shape": lhs_shape, "rhs_shape": rhs_shape, "spec": spec,
+       "lhs_shape": lhs_shape, "rhs_shape": rhs_shape, "pdot_spec": pdot_spec,
        "axis_resources": axis_resources, "mesh_data": mesh_data}
       for test_counter in [it.count()]
       for lhs_shape, rhs_shape in it.product(
-          [(2, 2), (2, 3, 2), (2, 3, 1, 2)],
+          [(2, 2), (2, 3, 2), (2, 3, 2, 1)],
           repeat=2)
-      for spec in all_pdot_specs(lhs_shape, rhs_shape)
+      for pdot_spec in all_pdot_specs(lhs_shape, rhs_shape)
       for axis_resources, mesh_data in schedules_from_pdot_spec(
-          spec, lhs_shape, rhs_shape)))
+          pdot_spec, lhs_shape, rhs_shape)))
   @ignore_xmap_warning()
-  def testPdotSystematic(self, lhs_shape, rhs_shape, spec, axis_resources,
+  def testPdotSystematic(self, lhs_shape, rhs_shape, pdot_spec, axis_resources,
                          mesh_data):
-    names = gen_axis_names(spec.num_mapped)
-    contract_names, batch_names = split_list(names, [spec.num_mapped_contract])
-    lhs_spec = dict(zip(spec.lhs_mapped, names))
-    rhs_spec = dict(zip(spec.rhs_mapped, names))
-
     rng = jtu.rand_default(self.rng())
     lhs = rng(lhs_shape, np.float32)
     rhs = rng(rhs_shape, np.float32)
 
     def pdot_fun(x, y):
-      print(f'pdot(x:{x.aval.str_short()}, y:{y.aval.str_short()},\n'
-            f'     axis_name={contract_names},\n'
-            f'     pos_contract={spec.pos_contract_after_mapping}\n'
-            f'     pos_batch={spec.pos_batch_after_mapping})')
-      return jax.lax.pdot(x, y, axis_name=contract_names,
-                          pos_batch=spec.pos_batch_after_mapping,
-                          pos_contract=spec.pos_contract_after_mapping)
+      # print(f'pdot(x:{x.aval.str_short()}, y:{y.aval.str_short()},\n'
+      #       f'     axis_name={contract_names},\n'
+      #       f'     pos_contract={spec.pos_contract_after_mapping}\n'
+      #       f'     pos_batch={spec.pos_batch_after_mapping})')
+      return jax.lax.pdot(x, y, axis_name=pdot_spec.contract_names,
+                          pos_batch=pdot_spec.pos_batch_after_mapping,
+                          pos_contract=pdot_spec.pos_contract_after_mapping)
 
-    fun = xmap(pdot_fun, in_axes=[lhs_spec, rhs_spec],
-                out_axes=[*batch_names, ...], axis_resources=axis_resources)
+    fun = xmap(pdot_fun, in_axes=[pdot_spec.lhs_in_axes, pdot_spec.rhs_in_axes],
+               out_axes=[*pdot_spec.batch_names, ...],
+               axis_resources=axis_resources)
 
     with generate_mesh(mesh_data):
       result = fun(lhs, rhs)
 
-    expected = lax.dot_general(lhs, rhs, [spec.all_contract, spec.all_batch])
+    expected = lax.dot_general(lhs, rhs, pdot_spec.dot_general_dim_nums)
     self.assertAllClose(result, expected, atol=1e-3, rtol=1e-3)
 
 
